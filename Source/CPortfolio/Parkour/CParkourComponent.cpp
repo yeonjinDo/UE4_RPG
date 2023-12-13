@@ -1,0 +1,472 @@
+#include "Parkour/CParkourComponent.h"
+#include "Global.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "Components/ArrowComponent.h"
+#include "Components/CMovementComponent.h"
+
+
+//#define LOG_UCParkourComponent
+
+void FParkourData::PlayMontage(class ACharacter* InCharacter)
+{
+	//FixedCamera
+	if (bFixedCamera)
+	{
+		UCMovementComponent* movement = CHelpers::GetComponent<UCMovementComponent>(InCharacter);
+
+		if (!!movement)
+			movement->EnableFixedCamera();
+	}
+
+
+	InCharacter->PlayAnimMontage(Montage, PlayRatio, SectionName);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+
+
+UCParkourComponent::UCParkourComponent()
+{
+	PrimaryComponentTick.bCanEverTick = true;
+
+	CHelpers::GetAsset<UDataTable>(&DataTable, "DataTable'/Game/Parkour/DT_Parkour.DT_Parkour'");
+	
+
+}
+
+
+void UCParkourComponent::BeginPlay()
+{
+	Super::BeginPlay();
+
+	//데이터 테이블에서 데이터를 불러온다
+	TArray<FParkourData*> datas;
+	DataTable->GetAllRows<FParkourData>("", datas);
+
+	//파쿠르 타입에 맞게 데이터를 집어넣는 과정
+	for(int32 i = 0; i< (int32)EParkourType::Max; i++)
+	{
+		TArray<FParkourData> temp;
+		for(FParkourData* data: datas)
+		{
+			if (data->Type == (EParkourType)i)
+				temp.Add(*data);
+		}
+
+		DataMap.Add((EParkourType)i, temp);
+	}
+
+	OwnerCharacter = Cast<ACharacter>(GetOwner());
+	USceneComponent* arrow = CHelpers::GetComponent<USceneComponent>(OwnerCharacter, "ArrowGroup");
+
+	TArray<USceneComponent*> components;
+	arrow->GetChildrenComponents(false, components);
+
+	for (int32 i = 0; i < (int32)EParkourArrowType::Max; i++)
+		Arrows[i] = Cast<UArrowComponent>(components[i]);
+}
+
+
+void UCParkourComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
+{
+	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+
+	CheckTrace_Land();
+
+}
+
+void UCParkourComponent::LineTrace(EParkourArrowType InType)
+{
+	UArrowComponent* arrow = Arrows[(int32)InType];
+	FLinearColor color = FLinearColor(arrow->ArrowColor);
+
+	FTransform transform = arrow->GetComponentToWorld();
+
+	FVector start = transform.GetLocation();
+	FVector end   = start + OwnerCharacter->GetActorForwardVector() * TraceDistance;
+
+
+	TArray<AActor*> ignores;
+	ignores.Add(OwnerCharacter);
+
+	UKismetSystemLibrary::LineTraceSingle(GetWorld(), start, end, ETraceTypeQuery::TraceTypeQuery3, false, ignores, DebugType, HitResults[(int32)InType], true, color, FLinearColor::White);
+}
+
+void UCParkourComponent::CheckTrace_Center()
+{
+	EParkourArrowType type = EParkourArrowType::Center;
+	LineTrace(type);
+
+	const FHitResult& hitResult = HitResults[(int32)type];
+	CheckFalse(hitResult.bBlockingHit);
+
+	UStaticMeshComponent* mesh = CHelpers::GetComponent<UStaticMeshComponent>(hitResult.GetActor());
+	CheckNull(mesh);
+
+
+	HitObstacle = hitResult.GetActor();
+
+	FVector minBound, maxBound;
+	mesh->GetLocalBounds(minBound, maxBound);
+
+	float x = FMath::Abs(minBound.X - maxBound.X);
+	float y = FMath::Abs(minBound.Y - maxBound.Y);
+	float z = FMath::Abs(minBound.Z - maxBound.Z);
+
+	HitObstacleExtent = FVector(x, y, z) * HitObstacle->GetActorScale();
+	 
+	HitDistance = hitResult.Distance;
+
+	ToFrontYaw = UKismetMathLibrary::MakeRotFromX(-hitResult.ImpactNormal).Yaw;
+						//Normal은 메시에 대한, impact normal 은 충돌에 대한 법선벡터
+
+
+
+#ifdef LOG_UCParkourComponent
+	CLog::Print(HitObstacle, 10);
+	CLog::Print(HitObstacleExtent, 11);
+	CLog::Print(HitDistance, 12);
+	CLog::Print(ToFrontYaw, 13);
+#endif //LOG_UCParkourComponent
+
+}
+
+void UCParkourComponent::CheckTrace_Ceil()
+{
+	LineTrace(EParkourArrowType::Ceil);
+}
+
+void UCParkourComponent::CheckTrace_Floor()
+{
+	LineTrace(EParkourArrowType::Floor);
+}
+
+void UCParkourComponent::CheckTrace_LeftRight()
+{
+	LineTrace(EParkourArrowType::Left);
+	LineTrace(EParkourArrowType::Right);
+}
+
+void UCParkourComponent::CheckTrace_Land()
+{
+	CheckFalse(OwnerCharacter->GetCharacterMovement()->IsFalling());
+
+	CheckTrue(bFalling);
+	bFalling = true;
+
+	//화살표 그리기
+	UArrowComponent* arrow = Arrows[(int32)EParkourArrowType::Land];
+	FLinearColor color = FLinearColor(arrow->ArrowColor);
+
+	FTransform transform = arrow->GetComponentToWorld();
+	FVector start = transform.GetLocation();
+
+	const TArray<FParkourData>* datas = DataMap.Find(EParkourType::Fall);
+	FVector end = start + transform.GetRotation().GetForwardVector() * (*datas)[0].Extent;	//getforwardvector -> 회전된 방향에 대한 전방
+
+
+	TArray<AActor*> ignores;
+	ignores.Add(OwnerCharacter);
+
+	UKismetSystemLibrary::LineTraceSingle(GetWorld(), start, end, ETraceTypeQuery::TraceTypeQuery1, false, 
+		ignores, DebugType, HitResults[(int32)EParkourArrowType::Land], true, color, FLinearColor::White);
+
+}
+
+bool UCParkourComponent::Check_Obstacle()
+{
+	CheckNullResult(HitObstacle, false);
+
+	//모서리가 아닐때를 체크(가운데, 양옆이 모두 hit되어야한다
+	bool b = true;
+	b &= HitResults[(int32)EParkourArrowType::Center].bBlockingHit;
+	b &= HitResults[(int32)EParkourArrowType::Left  ].bBlockingHit;
+	b &= HitResults[(int32)EParkourArrowType::Right ].bBlockingHit;
+	CheckFalseResult(b, false);
+
+	//3개의 normal 벡터가 같은지 판단
+	FVector center = HitResults[(int32)EParkourArrowType::Center].Normal;
+	FVector left   = HitResults[(int32)EParkourArrowType::Left  ].Normal;
+	FVector right  = HitResults[(int32)EParkourArrowType::Right ].Normal;
+
+	CheckFalseResult(center.Equals(left), false);
+	CheckFalseResult(center.Equals(right), false);
+
+
+	//전방방향(각도 체크)
+	FVector start = HitResults[(int32)EParkourArrowType::Center].ImpactPoint;
+	FVector end   = OwnerCharacter->GetActorLocation();
+	float lookAt  = UKismetMathLibrary::FindLookAtRotation(start, end).Yaw;
+
+	FVector impactNormal = HitResults[(int32)EParkourArrowType::Center].ImpactNormal;
+	float   impactAt     = UKismetMathLibrary::MakeRotFromX(impactNormal).Yaw;
+
+	float yaw = abs(abs(lookAt) - abs(impactAt));
+
+
+
+	CheckFalseResult(yaw <= AvailableFrontAngle, false);
+
+
+	return true;
+}
+
+void UCParkourComponent::DoParkour(bool bLanded)
+{
+	CheckFalse(Type == EParkourType::Max);
+
+		
+
+	//떨어질때 구르기 체크
+	if (bLanded && Check_FallMode())
+	{
+		DoParkour_Fall();
+
+		return;
+	}
+
+	//초기화
+	HitObstacle = NULL;
+	HitObstacleExtent = FVector::ZeroVector;
+	HitDistance = 0;
+	ToFrontYaw = 0;
+
+
+
+	//
+	CheckTrace_Center();
+	if (!!HitObstacle)
+	{
+		CheckTrace_Ceil();
+		CheckTrace_Floor();
+		CheckTrace_LeftRight();
+	}
+
+	CheckFalse(Check_Obstacle());
+	if (Check_ClimbMode())
+	{
+		DoParkour_Climb();
+
+		return;
+	}
+
+	if (Check_SlideMode())
+	{
+		DoParkour_Slide();
+
+		return;
+	}
+
+	//type별 do parkour 수행
+	FParkourData data;
+	if (Check_ObstacleMode(EParkourType::Normal, data))
+	{
+		DoParkour_Obstacle(data);
+
+		return;
+	}
+
+	if (Check_ObstacleMode(EParkourType::Short, data))
+	{
+		DoParkour_Obstacle(data);
+
+		return;
+	}
+
+	if (Check_ObstacleMode(EParkourType::Wall, data))
+	{
+		DoParkour_Obstacle(data);
+
+		return;
+	}
+
+}
+
+
+void UCParkourComponent::End_DoParkour()
+{
+	switch (Type)
+	{
+	case EParkourType::Climb:
+		End_DoParkour_Climb();
+		break;
+
+	case EParkourType::Slide:
+		End_DoParkour_Slide();
+		break;
+
+	case EParkourType::Fall:
+		GhostTrail->Destroy();
+		break;
+
+	case EParkourType::Normal:
+	case EParkourType::Short:
+	case EParkourType::Wall:
+		End_DoParkour_Obstacle();
+		break;
+
+	}
+
+	Type = EParkourType::Max;
+
+	//FixedCamera off
+	UCMovementComponent* movement = CHelpers::GetComponent<UCMovementComponent>(OwnerCharacter);
+
+	if (!!movement)
+		movement->DisableFixedCamera();
+	
+
+}
+
+bool UCParkourComponent::Check_ClimbMode()
+{	//ceil화살표 hit, 지정한 높이범위 안
+
+	CheckFalseResult(HitResults[(int32)EParkourArrowType::Ceil].bBlockingHit, false);
+	const TArray<FParkourData>* datas = DataMap.Find(EParkourType::Climb);
+	CheckFalseResult((*datas)[0].MinDistance < HitDistance, false);
+	CheckFalseResult((*datas)[0].MaxDistance > HitDistance, false);
+	CheckFalseResult(FMath::IsNearlyEqual((*datas)[0].Extent, HitObstacleExtent.Z, 10), false);
+
+	return true;
+}
+
+void UCParkourComponent::DoParkour_Climb()
+{
+	Type = EParkourType::Climb;
+
+	//충돌된 지점으로 이동, 충돌된 방향으로 이동 후 파쿠르 수행
+	OwnerCharacter->SetActorLocation(HitResults[(int32)EParkourArrowType::Center].ImpactPoint);
+	OwnerCharacter->SetActorRotation(FRotator(0, ToFrontYaw, 0));
+	(*DataMap.Find(EParkourType::Climb))[0].PlayMontage(OwnerCharacter);
+
+	OwnerCharacter->GetCharacterMovement()->SetMovementMode(EMovementMode::MOVE_Flying);
+}
+
+void UCParkourComponent::End_DoParkour_Climb()
+{
+	//Move_Walking으로 되돌려주기
+	OwnerCharacter->GetCharacterMovement()->SetMovementMode(EMovementMode::MOVE_Walking);
+}
+
+bool UCParkourComponent::Check_FallMode()
+{
+	CheckFalseResult(bFalling, false);
+	bFalling = false;
+
+	float distance = HitResults[(int32)EParkourArrowType::Land].Distance;
+
+	const TArray<FParkourData>* datas = DataMap.Find(EParkourType::Fall);
+	CheckFalseResult((*datas)[0].MinDistance < distance, false);
+	CheckFalseResult((*datas)[0].MaxDistance > distance, false);
+
+	return true;
+}
+
+void UCParkourComponent::DoParkour_Fall()
+{
+	Type = EParkourType::Fall;
+
+	
+	//몽타주 플레이
+	(*DataMap.Find(EParkourType::Fall))[0].PlayMontage(OwnerCharacter);
+
+	GhostTrail = CHelpers::Play_GhostTrail(GhostTrailClass, OwnerCharacter);
+}
+
+bool UCParkourComponent::Check_SlideMode()
+{
+	//hit
+	CheckTrueResult(HitResults[(int32)EParkourArrowType::Floor].bBlockingHit, false);
+	//거리안에
+	const TArray<FParkourData>* datas = DataMap.Find(EParkourType::Slide);
+	CheckFalseResult((*datas)[0].MinDistance < HitDistance, false);
+	CheckFalseResult((*datas)[0].MaxDistance > HitDistance, false);
+
+	//화살표 위치랑 부피로 박스를 만듦
+	UArrowComponent* arrow = Arrows[(int32)EParkourArrowType::Floor];
+	FLinearColor color = FLinearColor(arrow->ArrowColor);
+
+	FTransform transform = arrow->GetComponentToWorld();
+
+	FVector arrowLocation = transform.GetLocation();
+	FVector ownerLocation = OwnerCharacter->GetActorLocation();
+
+
+	float extent = (*datas)[0].Extent;
+	float z = arrowLocation.Z + extent;
+
+	FVector forward = OwnerCharacter->GetActorForwardVector();
+	forward = FVector(forward.X, forward.Y, 0);
+
+	FVector start = FVector(arrowLocation.X, arrowLocation.Y, z);
+	FVector end = start + forward * TraceDistance;
+
+
+	TArray<AActor*> ignores;
+	FHitResult hitResult;
+
+	UKismetSystemLibrary::BoxTraceSingle(GetWorld(), start, end, FVector(0, extent, extent),
+		OwnerCharacter->GetActorRotation() /*회전값*/, ETraceTypeQuery::TraceTypeQuery1, false, 
+		ignores, DebugType, hitResult, true);
+	CheckTrueResult(hitResult.bBlockingHit, false);
+
+	return true;
+} 
+
+void UCParkourComponent::DoParkour_Slide()
+{
+	Type = EParkourType::Slide;
+
+	OwnerCharacter->SetActorRotation(FRotator(0, ToFrontYaw, 0));
+	(*DataMap.Find(EParkourType::Slide))[0].PlayMontage(OwnerCharacter);
+
+	BackupObstacle = HitObstacle;
+	BackupObstacle->SetActorEnableCollision(false);
+}
+
+void UCParkourComponent::End_DoParkour_Slide()
+{
+	BackupObstacle->SetActorEnableCollision(true);
+	BackupObstacle = NULL;
+}
+
+bool UCParkourComponent::Check_ObstacleMode(EParkourType InType, FParkourData& OutData)
+{
+
+	CheckTrueResult(HitResults[(int32)EParkourArrowType::Ceil].bBlockingHit, false);
+
+	const TArray<FParkourData>* datas = DataMap.Find(InType);
+
+	for (int32 i = 0; i < (*datas).Num(); i++)
+	{
+		bool b = true;
+		b &= (*datas)[i].MinDistance < HitDistance;
+		b &= (*datas)[i].MaxDistance > HitDistance;
+		b &= FMath::IsNearlyEqual((*datas)[i].Extent, HitObstacleExtent.Y, 10);
+
+		OutData = (*datas)[i];
+		CheckTrueResult(b, true);
+	}
+
+	return false;
+
+}
+
+void UCParkourComponent::DoParkour_Obstacle(FParkourData& InData)
+{
+	Type = InData.Type;
+
+	OwnerCharacter->SetActorRotation(FRotator(0, ToFrontYaw, 0));
+	InData.PlayMontage(OwnerCharacter);
+
+	BackupObstacle = HitObstacle;
+	BackupObstacle->SetActorEnableCollision(false);
+}
+
+void UCParkourComponent::End_DoParkour_Obstacle()
+{
+	BackupObstacle->SetActorEnableCollision(true);
+	BackupObstacle = NULL;
+}
